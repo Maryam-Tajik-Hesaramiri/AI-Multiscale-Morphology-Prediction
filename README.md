@@ -1,73 +1,87 @@
 # AI-Driven Multiscale Morphology Prediction
 
-An AI-driven framework for connecting **manufacturing process parameters, SEM image morphology, and machine learning** to characterize and predict material structures.
+A computational materials framework connecting **manufacturing process parameters, SEM image morphology, computer vision, and machine learning** to characterize and predict material structures.
 
-This research focuses on hydrothermally grown ZnO structures and combines computer vision, deep learning, statistical analysis, and experimental design to develop a data-driven materials processing workflow.
+This research focuses on hydrothermally grown ZnO and integrates experimental design, microscopy, deep-learning segmentation, quantitative morphology analysis, and small-data predictive modeling.
 
 ## Project Overview
 
-Understanding how processing conditions influence material morphology is an important challenge in advanced manufacturing and materials engineering.
+Understanding how manufacturing conditions influence material morphology is an important challenge in materials processing and advanced manufacturing.
 
-This project develops a computational workflow to:
+This project develops an end-to-end workflow to:
 
-- Segment ZnO structures from SEM images using deep learning
+- Segment ZnO structures from SEM images using U-Net
 - Quantify morphology from microscopy data
-- Connect processing parameters to morphological features
-- Train machine-learning models for morphology prediction
-- Identify influential processing parameters
-- Guide new experimental conditions for model validation
+- Connect hydrothermal growth parameters to morphological features
+- Compare machine-learning models for morphology prediction
+- Evaluate models while preserving experimental independence
+- Support the design of new experiments for external validation
 
 ## Workflow
 
-**Processing Parameters → SEM Imaging → U-Net Segmentation → Morphology Extraction → Machine Learning → Experimental Validation**
+**Growth Parameters → SEM Imaging → U-Net Segmentation → Morphology Quantification → Predictive Modeling → Experimental Validation**
 
-The experimental inputs include:
+The investigated processing parameters include:
 
 - Stirring speed (RPM)
 - pH
 - Growth time
 - Growth temperature
 
-SEM images are analyzed at multiple magnifications to capture morphology across different length scales.
+SEM images are collected across experimental runs and analyzed to quantify morphology at different length scales.
 
-## Computer Vision & Deep Learning
+## U-Net Segmentation
 
-A U-Net-based semantic segmentation pipeline was developed to distinguish ZnO structures from the substrate in SEM images.
+A U-Net semantic-segmentation pipeline is used to distinguish ZnO structures from the substrate in SEM images.
 
 The segmentation workflow includes:
 
 - Manual ground-truth annotation
 - Train/validation/test dataset splitting
-- Patch-based SEM image processing
-- Data augmentation
-- U-Net semantic segmentation
-- Dice and IoU evaluation
-- Morphological feature extraction
+- Patch-based SEM processing
+- Run-balanced and coverage-aware training sampling
+- U-Net training and evaluation
+- Dice and IoU performance assessment
+- Sliding-window full-image inference
+- Reconstruction of full-resolution probability maps and binary masks
+- Image-level ZnO coverage extraction
 
-## Machine Learning
+Overlapping patch probabilities are averaged before thresholding during full-image reconstruction.
 
-Extracted image features are combined with experimental processing parameters to construct a materials-processing dataset.
+## Morphology Prediction
 
-Machine-learning models are evaluated using **Leave-One-Run-Out cross-validation** to reduce data leakage between SEM images collected from the same experimental condition.
+Image-derived morphology measurements are combined with the experimental growth parameters:
 
-Current predictive modeling includes:
+**RPM + pH + Time + Temperature → ZnO Coverage + Mean Nanosheet Width**
 
-- Extra Trees regression
-- Gaussian Process regression
-- Model comparison and cross-validation
-- Parameter sensitivity analysis
-- Response-surface analysis
-- Experimental validation design
+The dataset contains repeated SEM observations from **9 independent experimental runs**. Images collected under the same growth condition are therefore not treated as independent experimental samples.
+
+Model performance is evaluated using **Leave-One-Run-Out (LORO) cross-validation** to prevent information leakage between images from the same experimental condition.
+
+Candidate models include:
+
+- Linear Regression
+- Ridge Regression
+- Bayesian Ridge
+- Random Forest
+- Extra Trees
+- Gradient Boosting
+- Additive Gaussian Process
+- Weighted ensemble
+
+Performance is compared using MAE, RMSE, and R².
+
+Hierarchical bootstrap analysis is also used to characterize prediction uncertainty while preserving the nested experimental structure.
 
 ## Technologies
 
-**Programming & Data Analysis**
+**Programming & Machine Learning**
 
-`Python` `NumPy` `Pandas` `scikit-learn`
+`Python` `NumPy` `Pandas` `scikit-learn` `PyTorch`
 
-**Deep Learning & Computer Vision**
+**Computer Vision**
 
-`PyTorch` `U-Net` `Semantic Segmentation` `Image Processing`
+`U-Net` `Semantic Segmentation` `Image Processing` `Sliding-Window Inference`
 
 **Materials & Manufacturing**
 
@@ -75,24 +89,52 @@ Current predictive modeling includes:
 
 ## Repository Structure
 
-The repository will contain selected code and documentation for the major stages of the workflow:
-
 ```text
 AI-Multiscale-Morphology-Prediction/
 │
 ├── segmentation/
-│   └── U-Net training and evaluation
+│   ├── dataset_split.py
+│   ├── dataset_statistics.py
+│   ├── prepare_dataloader.py
+│   ├── audit_training_distribution.py
+│   ├── unet.py
+│   ├── losses_metrics.py
+│   ├── train.py
+│   ├── evaluate.py
+│   ├── predict_full_dataset.py
+│   └── README.md
 │
-├── morphology_analysis/
-│   └── SEM feature extraction
+├── prediction/
+│   ├── build_ai_dataset.py
+│   ├── train_morphology_predictor.py
+│   └── README.md
 │
-├── machine_learning/
-│   └── Predictive modeling and cross-validation
-│
-├── experimental_validation/
-│   └── Candidate selection and validation design
-│
-├── figures/
-│   └── Selected workflow and result visualizations
-│
+├── .gitignore
 └── README.md
+```
+
+### `segmentation/`
+
+Contains the U-Net workflow for dataset preparation, training, evaluation, and full-resolution SEM inference.
+
+### `prediction/`
+
+Contains the workflow for combining image-derived morphology with experimental parameters and evaluating growth-parameter-to-morphology regression models.
+
+## Current Scope
+
+The repository contains selected research code illustrating the computational workflow rather than the complete raw experimental dataset.
+
+Large SEM datasets, manually annotated masks, trained model checkpoints, and intermediate research outputs are excluded from version control.
+
+The current predictive models are based on 9 independent DOE conditions and are intended primarily for interpretation and prediction within or near the investigated experimental domain.
+
+External validation using newly synthesized conditions is planned as the next stage of the study.
+
+## Research Goal
+
+The long-term objective is to develop a data-driven framework that links:
+
+**Manufacturing Conditions → Material Morphology → Predictive Models**
+
+to support more systematic design and optimization of functional material-processing conditions.
