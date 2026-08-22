@@ -1,0 +1,2054 @@
+#!/usr/bin/env python
+"""
+train_morphology_predictor.py
+=============================
+
+Train and evaluate small-data morphology predictors for hydrothermally
+grown ZnO using DOE synthesis parameters.
+
+Inputs
+------
+RPM
+pH
+Time (h)
+Temperature (°C)
+
+Targets
+-------
+ZnO coverage (%)
+Mean nanosheet width (µm)
+
+Experimental structure
+----------------------
+SEM images are repeated measurements nested within 9 independent DOE Runs.
+Therefore, model validation is performed at the Run level using strict
+Leave-One-Run-Out (LORO) cross-validation.
+
+Models
+------
+- Linear Regression
+- Ridge Regression
+- Bayesian Ridge
+- Random Forest
+- Extra Trees
+- Gradient Boosting
+- Additive Gaussian Process
+- Weighted ensemble of the candidate models
+
+The script also performs hierarchical bootstrap analysis for the selected
+predictor and saves model-comparison tables, LORO predictions, figures,
+training-domain metadata, and reproducibility information.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from sklearn.base import BaseEstimator, RegressorMixin, clone
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    RandomForestRegressor,
+)
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import (
+    ConstantKernel,
+    RBF,
+    WhiteKernel,
+)
+from sklearn.linear_model import (
+    BayesianRidge,
+    LinearRegression,
+    Ridge,
+)
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
+from sklearn.pipeline import Pipeline
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DATA_DIR = (
+    SCRIPT_DIR
+    / "ai_dataset"
+)
+
+IMAGE_LEVEL_CSV = (
+    DATA_DIR
+    / "image_level.csv"
+)
+
+RUN_LEVEL_CSV = (
+    DATA_DIR
+    / "run_level.csv"
+)
+
+OUTPUT_DIR = (
+    SCRIPT_DIR
+    / "results"
+)
+
+RANDOM_SEED = 42
+N_BOOTSTRAP = 500
+
+RUN_COLUMN = "run_number"
+
+FEATURES = [
+    "rpm",
+    "ph",
+    "time_h",
+    "temperature_c",
+]
+
+IMAGE_TARGETS = {
+    "Coverage": "zno_coverage_percent",
+    "Width": "mean_width_um",
+}
+
+RUN_TARGETS = {
+    "Coverage": "coverage_mean",
+    "Width": "width_mean",
+}
+
+UNITS = {
+    "Coverage": "%",
+    "Width": "µm",
+}
+
+ENSEMBLE_MODELS = [
+    "Linear",
+    "Ridge",
+    "BayesianRidge",
+    "RandomForest",
+    "ExtraTrees",
+    "GradientBoosting",
+    "AdditiveGP",
+]
+
+
+# =============================================================================
+# METRICS
+# =============================================================================
+
+def calculate_metrics(
+    y_true,
+    y_pred,
+) -> dict:
+    """Calculate regression metrics."""
+
+    y_true = np.asarray(
+        y_true,
+        dtype=float,
+    )
+
+    y_pred = np.asarray(
+        y_pred,
+        dtype=float,
+    )
+
+    mae = mean_absolute_error(
+        y_true,
+        y_pred,
+    )
+
+    rmse = np.sqrt(
+        mean_squared_error(
+            y_true,
+            y_pred,
+        )
+    )
+
+    if (
+        len(y_true) >= 2
+        and np.var(y_true) > 0
+    ):
+        r2 = r2_score(
+            y_true,
+            y_pred,
+        )
+    else:
+        r2 = np.nan
+
+    return {
+        "MAE": float(mae),
+        "RMSE": float(rmse),
+        "R2": float(r2),
+    }
+
+
+# =============================================================================
+# DOE CODING
+# =============================================================================
+
+class DOECoder(BaseEstimator):
+    """
+    Scale each DOE factor around the training-fold center.
+
+    For a symmetric three-level DOE:
+
+        low  -> approximately -1
+        mid  -> approximately  0
+        high -> approximately +1
+
+    The transformation is fitted independently within each LORO training fold.
+    """
+
+    def fit(
+        self,
+        X,
+        y=None,
+    ):
+        X = self._to_array(
+            X
+        )
+
+        self.minimum_ = np.min(
+            X,
+            axis=0,
+        )
+
+        self.maximum_ = np.max(
+            X,
+            axis=0,
+        )
+
+        self.center_ = (
+            self.minimum_
+            + self.maximum_
+        ) / 2.0
+
+        self.half_range_ = (
+            self.maximum_
+            - self.minimum_
+        ) / 2.0
+
+        self.half_range_[
+            self.half_range_ == 0
+        ] = 1.0
+
+        return self
+
+    def transform(
+        self,
+        X,
+    ):
+        X = self._to_array(
+            X
+        )
+
+        return (
+            X - self.center_
+        ) / self.half_range_
+
+    @staticmethod
+    def _to_array(X):
+        if isinstance(
+            X,
+            pd.DataFrame,
+        ):
+            return X.to_numpy(
+                dtype=float
+            )
+
+        return np.asarray(
+            X,
+            dtype=float,
+        )
+
+
+# =============================================================================
+# ADDITIVE GAUSSIAN PROCESS
+# =============================================================================
+
+class AdditiveGaussianProcessRegressor(
+    BaseEstimator,
+    RegressorMixin,
+):
+    """
+    Conservative additive Gaussian Process.
+
+    Instead of fitting one flexible four-dimensional GP to only a few DOE Runs,
+    one one-dimensional GP is fitted for each synthesis factor.
+
+    The component predictions are then averaged around the overall response
+    mean.
+    """
+
+    def __init__(
+        self,
+        random_state=42,
+    ):
+        self.random_state = (
+            random_state
+        )
+
+    def fit(
+        self,
+        X,
+        y,
+    ):
+        X = np.asarray(
+            X,
+            dtype=float,
+        )
+
+        y = np.asarray(
+            y,
+            dtype=float,
+        )
+
+        self.y_mean_ = float(
+            np.mean(y)
+        )
+
+        centered_y = (
+            y - self.y_mean_
+        )
+
+        self.models_ = []
+
+        for feature_index in range(
+            X.shape[1]
+        ):
+            kernel = (
+                ConstantKernel(
+                    1.0,
+                    constant_value_bounds="fixed",
+                )
+                * RBF(
+                    length_scale=1.0,
+                    length_scale_bounds="fixed",
+                )
+                + WhiteKernel(
+                    noise_level=0.15,
+                    noise_level_bounds="fixed",
+                )
+            )
+
+            model = (
+                GaussianProcessRegressor(
+                    kernel=kernel,
+                    alpha=1e-6,
+                    normalize_y=False,
+                    optimizer=None,
+                    random_state=self.random_state,
+                )
+            )
+
+            model.fit(
+                X[
+                    :,
+                    [feature_index],
+                ],
+                centered_y,
+            )
+
+            self.models_.append(
+                model
+            )
+
+        return self
+
+    def predict(
+        self,
+        X,
+        return_std=False,
+    ):
+        X = np.asarray(
+            X,
+            dtype=float,
+        )
+
+        component_means = []
+        component_variances = []
+
+        for feature_index, model in enumerate(
+            self.models_
+        ):
+            mean, std = model.predict(
+                X[
+                    :,
+                    [feature_index],
+                ],
+                return_std=True,
+            )
+
+            component_means.append(
+                mean
+            )
+
+            component_variances.append(
+                std ** 2
+            )
+
+        average_component = np.mean(
+            np.vstack(
+                component_means
+            ),
+            axis=0,
+        )
+
+        prediction = (
+            self.y_mean_
+            + average_component
+        )
+
+        if return_std:
+            variance = np.mean(
+                np.vstack(
+                    component_variances
+                ),
+                axis=0,
+            )
+
+            return (
+                prediction,
+                np.sqrt(
+                    variance
+                ),
+            )
+
+        return prediction
+
+
+# =============================================================================
+# DATA LOADING
+# =============================================================================
+
+def load_data():
+    """
+    Load the image-level dataset and construct Run-level modeling statistics.
+    """
+
+    if not IMAGE_LEVEL_CSV.is_file():
+        raise FileNotFoundError(
+            f"Image-level dataset not found:\n"
+            f"{IMAGE_LEVEL_CSV}\n\n"
+            "Run build_ai_dataset.py first."
+        )
+
+    image_df = pd.read_csv(
+        IMAGE_LEVEL_CSV
+    )
+
+    required_columns = (
+        [RUN_COLUMN]
+        + FEATURES
+        + list(
+            IMAGE_TARGETS.values()
+        )
+    )
+
+    missing = set(
+        required_columns
+    ) - set(
+        image_df.columns
+    )
+
+    if missing:
+        raise KeyError(
+            "Image-level dataset is missing columns: "
+            f"{sorted(missing)}"
+        )
+
+    if image_df[
+        required_columns
+    ].isna().any().any():
+        raise ValueError(
+            "Required modeling columns contain "
+            "missing values."
+        )
+
+    runs = sorted(
+        image_df[
+            RUN_COLUMN
+        ].unique()
+    )
+
+    if len(runs) != 9:
+        raise RuntimeError(
+            f"Expected 9 independent Runs, "
+            f"found {len(runs)}."
+        )
+
+    # Confirm that each Run represents one DOE condition.
+    design_check = (
+        image_df.groupby(
+            RUN_COLUMN
+        )[FEATURES]
+        .nunique()
+    )
+
+    if (
+        design_check > 1
+    ).any().any():
+        raise RuntimeError(
+            "At least one Run contains "
+            "multiple DOE conditions."
+        )
+
+    # Recalculate Run-level morphology statistics directly
+    # from the image-level measurements.
+    run_statistics = (
+        image_df.groupby(
+            RUN_COLUMN
+        )
+        .agg(
+            n_images=(
+                RUN_COLUMN,
+                "size",
+            ),
+            coverage_mean=(
+                "zno_coverage_percent",
+                "mean",
+            ),
+            coverage_sd=(
+                "zno_coverage_percent",
+                "std",
+            ),
+            width_mean=(
+                "mean_width_um",
+                "mean",
+            ),
+            width_sd=(
+                "mean_width_um",
+                "std",
+            ),
+        )
+        .reset_index()
+    )
+
+    design = (
+        image_df.groupby(
+            RUN_COLUMN,
+            as_index=False,
+        )[FEATURES]
+        .first()
+    )
+
+    model_df = design.merge(
+        run_statistics,
+        on=RUN_COLUMN,
+        how="inner",
+    )
+
+    model_df[
+        "coverage_sem"
+    ] = (
+        model_df[
+            "coverage_sd"
+        ]
+        / np.sqrt(
+            model_df[
+                "n_images"
+            ]
+        )
+    )
+
+    model_df[
+        "width_sem"
+    ] = (
+        model_df[
+            "width_sd"
+        ]
+        / np.sqrt(
+            model_df[
+                "n_images"
+            ]
+        )
+    )
+
+    return (
+        image_df,
+        model_df,
+    )
+
+
+# =============================================================================
+# MODEL LIBRARY
+# =============================================================================
+
+def create_models(
+    seed=42,
+) -> dict:
+    """Create conservative regression models for the small DOE dataset."""
+
+    return {
+        "Linear": Pipeline(
+            [
+                (
+                    "doe",
+                    DOECoder(),
+                ),
+                (
+                    "model",
+                    LinearRegression(),
+                ),
+            ]
+        ),
+
+        "Ridge": Pipeline(
+            [
+                (
+                    "doe",
+                    DOECoder(),
+                ),
+                (
+                    "model",
+                    Ridge(
+                        alpha=1.0
+                    ),
+                ),
+            ]
+        ),
+
+        "BayesianRidge": Pipeline(
+            [
+                (
+                    "doe",
+                    DOECoder(),
+                ),
+                (
+                    "model",
+                    BayesianRidge(),
+                ),
+            ]
+        ),
+
+        "RandomForest": Pipeline(
+            [
+                (
+                    "doe",
+                    DOECoder(),
+                ),
+                (
+                    "model",
+                    RandomForestRegressor(
+                        n_estimators=500,
+                        max_depth=2,
+                        min_samples_leaf=1,
+                        max_features=1.0,
+                        random_state=seed,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        ),
+
+        "ExtraTrees": Pipeline(
+            [
+                (
+                    "doe",
+                    DOECoder(),
+                ),
+                (
+                    "model",
+                    ExtraTreesRegressor(
+                        n_estimators=500,
+                        max_depth=2,
+                        min_samples_leaf=1,
+                        max_features=1.0,
+                        random_state=seed,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        ),
+
+        "GradientBoosting": Pipeline(
+            [
+                (
+                    "doe",
+                    DOECoder(),
+                ),
+                (
+                    "model",
+                    GradientBoostingRegressor(
+                        n_estimators=80,
+                        learning_rate=0.03,
+                        max_depth=1,
+                        min_samples_leaf=1,
+                        loss="squared_error",
+                        random_state=seed,
+                    ),
+                ),
+            ]
+        ),
+
+        "AdditiveGP": Pipeline(
+            [
+                (
+                    "doe",
+                    DOECoder(),
+                ),
+                (
+                    "model",
+                    AdditiveGaussianProcessRegressor(
+                        random_state=seed
+                    ),
+                ),
+            ]
+        ),
+    }
+
+
+# =============================================================================
+# LEAVE-ONE-RUN-OUT VALIDATION
+# =============================================================================
+
+def run_loro(
+    model_df: pd.DataFrame,
+):
+    """Evaluate each model using strict Leave-One-Run-Out validation."""
+
+    models = create_models(
+        RANDOM_SEED
+    )
+
+    runs = sorted(
+        model_df[
+            RUN_COLUMN
+        ].unique()
+    )
+
+    predictions = []
+
+    for target in [
+        "Coverage",
+        "Width",
+    ]:
+        target_column = (
+            RUN_TARGETS[
+                target
+            ]
+        )
+
+        print(
+            "\n"
+            + "=" * 72
+        )
+
+        print(
+            f"LORO TARGET: {target}"
+        )
+
+        print(
+            "=" * 72
+        )
+
+        for fold, held_out_run in enumerate(
+            runs,
+            start=1,
+        ):
+            train = model_df[
+                model_df[
+                    RUN_COLUMN
+                ]
+                != held_out_run
+            ]
+
+            test = model_df[
+                model_df[
+                    RUN_COLUMN
+                ]
+                == held_out_run
+            ]
+
+            X_train = train[
+                FEATURES
+            ]
+
+            y_train = train[
+                target_column
+            ].to_numpy(
+                dtype=float
+            )
+
+            X_test = test[
+                FEATURES
+            ]
+
+            actual = float(
+                test[
+                    target_column
+                ].iloc[0]
+            )
+
+            for (
+                model_name,
+                base_model,
+            ) in models.items():
+
+                model = clone(
+                    base_model
+                )
+
+                model.fit(
+                    X_train,
+                    y_train,
+                )
+
+                prediction = float(
+                    np.asarray(
+                        model.predict(
+                            X_test
+                        )
+                    ).reshape(-1)[0]
+                )
+
+                predictions.append(
+                    {
+                        "fold": fold,
+                        "held_out_run": int(
+                            held_out_run
+                        ),
+                        "target": target,
+                        "model": model_name,
+                        "actual": actual,
+                        "predicted": prediction,
+                        "error":
+                            prediction
+                            - actual,
+                        "absolute_error":
+                            abs(
+                                prediction
+                                - actual
+                            ),
+                    }
+                )
+
+            print(
+                f"Fold {fold}/"
+                f"{len(runs)} complete "
+                f"— held-out Run "
+                f"{held_out_run}"
+            )
+
+    prediction_df = pd.DataFrame(
+        predictions
+    )
+
+    comparison_df = (
+        summarize_models(
+            prediction_df
+        )
+    )
+
+    return (
+        prediction_df,
+        comparison_df,
+    )
+
+
+def summarize_models(
+    prediction_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Summarize LORO performance for every model."""
+
+    rows = []
+
+    for (
+        target,
+        model,
+    ), group in prediction_df.groupby(
+        [
+            "target",
+            "model",
+        ]
+    ):
+        metrics = calculate_metrics(
+            group[
+                "actual"
+            ],
+            group[
+                "predicted"
+            ],
+        )
+
+        errors = group[
+            "error"
+        ].to_numpy(
+            dtype=float
+        )
+
+        rows.append(
+            {
+                "target": target,
+                "model": model,
+                "n_runs": len(
+                    group
+                ),
+                **metrics,
+                "MeanSignedError":
+                    float(
+                        np.mean(
+                            errors
+                        )
+                    ),
+                "ErrorSD":
+                    float(
+                        np.std(
+                            errors,
+                            ddof=1,
+                        )
+                    ),
+                "MaxAbsError":
+                    float(
+                        np.max(
+                            np.abs(
+                                errors
+                            )
+                        )
+                    ),
+            }
+        )
+
+    return (
+        pd.DataFrame(
+            rows
+        )
+        .sort_values(
+            [
+                "target",
+                "RMSE",
+                "MAE",
+            ]
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+# =============================================================================
+# WEIGHTED ENSEMBLE
+# =============================================================================
+
+def calculate_ensemble_weights(
+    comparison_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Calculate inverse-squared-RMSE ensemble weights.
+
+    Lower LORO RMSE gives a model more weight.
+    """
+
+    results = []
+
+    for target in [
+        "Coverage",
+        "Width",
+    ]:
+        subset = comparison_df[
+            (
+                comparison_df[
+                    "target"
+                ]
+                == target
+            )
+            & (
+                comparison_df[
+                    "model"
+                ].isin(
+                    ENSEMBLE_MODELS
+                )
+            )
+        ].copy()
+
+        rmse = subset[
+            "RMSE"
+        ].to_numpy(
+            dtype=float
+        )
+
+        raw_weights = (
+            1.0
+            / np.maximum(
+                rmse ** 2,
+                1e-12,
+            )
+        )
+
+        subset[
+            "ensemble_weight"
+        ] = (
+            raw_weights
+            / raw_weights.sum()
+        )
+
+        results.append(
+            subset[
+                [
+                    "target",
+                    "model",
+                    "RMSE",
+                    "MAE",
+                    "R2",
+                    "ensemble_weight",
+                ]
+            ]
+        )
+
+    return pd.concat(
+        results,
+        ignore_index=True,
+    )
+
+
+def add_ensemble_predictions(
+    prediction_df: pd.DataFrame,
+    weight_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Add weighted-ensemble predictions to the LORO results."""
+
+    ensemble_rows = []
+
+    for target in [
+        "Coverage",
+        "Width",
+    ]:
+        weights = (
+            weight_df[
+                weight_df[
+                    "target"
+                ]
+                == target
+            ]
+            .set_index(
+                "model"
+            )[
+                "ensemble_weight"
+            ]
+            .to_dict()
+        )
+
+        target_predictions = (
+            prediction_df[
+                prediction_df[
+                    "target"
+                ]
+                == target
+            ]
+        )
+
+        for (
+            held_out_run,
+            group,
+        ) in target_predictions.groupby(
+            "held_out_run"
+        ):
+            group = group[
+                group[
+                    "model"
+                ].isin(
+                    weights
+                )
+            ]
+
+            prediction = sum(
+                weights[
+                    row["model"]
+                ]
+                * float(
+                    row[
+                        "predicted"
+                    ]
+                )
+                for _, row
+                in group.iterrows()
+            )
+
+            actual = float(
+                group[
+                    "actual"
+                ].iloc[0]
+            )
+
+            ensemble_rows.append(
+                {
+                    "fold": int(
+                        group[
+                            "fold"
+                        ].iloc[0]
+                    ),
+                    "held_out_run": int(
+                        held_out_run
+                    ),
+                    "target": target,
+                    "model":
+                        "WeightedEnsemble",
+                    "actual":
+                        actual,
+                    "predicted":
+                        float(
+                            prediction
+                        ),
+                    "error":
+                        float(
+                            prediction
+                            - actual
+                        ),
+                    "absolute_error":
+                        float(
+                            abs(
+                                prediction
+                                - actual
+                            )
+                        ),
+                }
+            )
+
+    ensemble_df = pd.DataFrame(
+        ensemble_rows
+    )
+
+    return pd.concat(
+        [
+            prediction_df,
+            ensemble_df,
+        ],
+        ignore_index=True,
+    )
+
+
+# =============================================================================
+# FINAL MODEL SELECTION
+# =============================================================================
+
+def select_final_predictors(
+    comparison_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Select the best predictor separately for Coverage and Width.
+
+    Selection priority:
+        1. Lowest RMSE
+        2. Lowest MAE
+        3. Lowest error SD
+    """
+
+    selected = []
+
+    for target in [
+        "Coverage",
+        "Width",
+    ]:
+        subset = (
+            comparison_df[
+                comparison_df[
+                    "target"
+                ]
+                == target
+            ]
+            .sort_values(
+                [
+                    "RMSE",
+                    "MAE",
+                    "ErrorSD",
+                ]
+            )
+        )
+
+        selected.append(
+            subset.iloc[0]
+        )
+
+    return (
+        pd.DataFrame(
+            selected
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+# =============================================================================
+# BOOTSTRAP
+# =============================================================================
+
+def predict_selected_model(
+    train_X,
+    train_y,
+    test_X,
+    selected_model,
+    target,
+    weight_df,
+) -> float:
+    """Fit either one model or the weighted ensemble."""
+
+    models = create_models(
+        RANDOM_SEED
+    )
+
+    if (
+        selected_model
+        != "WeightedEnsemble"
+    ):
+        model = clone(
+            models[
+                selected_model
+            ]
+        )
+
+        model.fit(
+            train_X,
+            train_y,
+        )
+
+        return float(
+            np.asarray(
+                model.predict(
+                    test_X
+                )
+            ).reshape(-1)[0]
+        )
+
+    weights = (
+        weight_df[
+            weight_df[
+                "target"
+            ]
+            == target
+        ]
+        .set_index(
+            "model"
+        )[
+            "ensemble_weight"
+        ]
+        .to_dict()
+    )
+
+    prediction = 0.0
+
+    for (
+        model_name,
+        weight,
+    ) in weights.items():
+
+        model = clone(
+            models[
+                model_name
+            ]
+        )
+
+        model.fit(
+            train_X,
+            train_y,
+        )
+
+        prediction += (
+            float(
+                weight
+            )
+            * float(
+                np.asarray(
+                    model.predict(
+                        test_X
+                    )
+                ).reshape(-1)[0]
+            )
+        )
+
+    return float(
+        prediction
+    )
+
+
+def hierarchical_bootstrap(
+    image_df: pd.DataFrame,
+    model_df: pd.DataFrame,
+    selected_df: pd.DataFrame,
+    weight_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Bootstrap repeated SEM measurements within Runs.
+
+    The DOE Runs themselves remain the independent experimental units.
+    """
+
+    rng = np.random.default_rng(
+        RANDOM_SEED
+    )
+
+    runs = sorted(
+        model_df[
+            RUN_COLUMN
+        ].unique()
+    )
+
+    indexed_model_df = (
+        model_df.set_index(
+            RUN_COLUMN
+        )
+    )
+
+    rows = []
+
+    for target in [
+        "Coverage",
+        "Width",
+    ]:
+        selected_model = (
+            selected_df.loc[
+                selected_df[
+                    "target"
+                ]
+                == target,
+                "model",
+            ]
+            .iloc[0]
+        )
+
+        image_target = (
+            IMAGE_TARGETS[
+                target
+            ]
+        )
+
+        print(
+            "\n"
+            + "=" * 72
+        )
+
+        print(
+            f"BOOTSTRAP: {target} "
+            f"— {selected_model}"
+        )
+
+        print(
+            "=" * 72
+        )
+
+        for held_out_run in runs:
+
+            train_runs = [
+                run
+                for run in runs
+                if run
+                != held_out_run
+            ]
+
+            train_X = (
+                indexed_model_df.loc[
+                    train_runs,
+                    FEATURES,
+                ]
+            )
+
+            test_X = (
+                indexed_model_df.loc[
+                    [held_out_run],
+                    FEATURES,
+                ]
+            )
+
+            bootstrap_predictions = []
+
+            for _ in range(
+                N_BOOTSTRAP
+            ):
+                bootstrap_targets = []
+
+                for run in train_runs:
+
+                    values = (
+                        image_df.loc[
+                            image_df[
+                                RUN_COLUMN
+                            ]
+                            == run,
+                            image_target,
+                        ]
+                        .to_numpy(
+                            dtype=float
+                        )
+                    )
+
+                    resampled = (
+                        rng.choice(
+                            values,
+                            size=len(
+                                values
+                            ),
+                            replace=True,
+                        )
+                    )
+
+                    bootstrap_targets.append(
+                        float(
+                            np.mean(
+                                resampled
+                            )
+                        )
+                    )
+
+                prediction = (
+                    predict_selected_model(
+                        train_X=train_X,
+                        train_y=np.asarray(
+                            bootstrap_targets
+                        ),
+                        test_X=test_X,
+                        selected_model=
+                            selected_model,
+                        target=target,
+                        weight_df=
+                            weight_df,
+                    )
+                )
+
+                bootstrap_predictions.append(
+                    prediction
+                )
+
+            bootstrap_predictions = (
+                np.asarray(
+                    bootstrap_predictions,
+                    dtype=float,
+                )
+            )
+
+            actual_values = (
+                image_df.loc[
+                    image_df[
+                        RUN_COLUMN
+                    ]
+                    == held_out_run,
+                    image_target,
+                ]
+                .to_numpy(
+                    dtype=float
+                )
+            )
+
+            rows.append(
+                {
+                    "target": target,
+                    "model":
+                        selected_model,
+                    "held_out_run":
+                        int(
+                            held_out_run
+                        ),
+                    "actual_run_mean":
+                        float(
+                            np.mean(
+                                actual_values
+                            )
+                        ),
+                    "predicted_mean":
+                        float(
+                            np.mean(
+                                bootstrap_predictions
+                            )
+                        ),
+                    "ci95_low":
+                        float(
+                            np.percentile(
+                                bootstrap_predictions,
+                                2.5,
+                            )
+                        ),
+                    "ci95_high":
+                        float(
+                            np.percentile(
+                                bootstrap_predictions,
+                                97.5,
+                            )
+                        ),
+                    "prediction_sd":
+                        float(
+                            np.std(
+                                bootstrap_predictions,
+                                ddof=1,
+                            )
+                        ),
+                    "n_bootstrap":
+                        N_BOOTSTRAP,
+                }
+            )
+
+            print(
+                f"Run "
+                f"{held_out_run}: complete"
+            )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# =============================================================================
+# TRAINING DOMAIN
+# =============================================================================
+
+def build_training_domain(
+    model_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Describe the DOE domain used for model training."""
+
+    rows = []
+
+    for feature in FEATURES:
+
+        values = np.sort(
+            model_df[
+                feature
+            ].unique()
+        )
+
+        rows.append(
+            {
+                "feature": feature,
+                "min": float(
+                    np.min(
+                        values
+                    )
+                ),
+                "max": float(
+                    np.max(
+                        values
+                    )
+                ),
+                "mean": float(
+                    np.mean(
+                        values
+                    )
+                ),
+                "std": float(
+                    np.std(
+                        values,
+                        ddof=1,
+                    )
+                ),
+                "levels":
+                    "; ".join(
+                        str(
+                            float(
+                                value
+                            )
+                        )
+                        for value
+                        in values
+                    ),
+            }
+        )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# =============================================================================
+# FIGURES
+# =============================================================================
+
+def save_figure(
+    fig,
+    path: Path,
+) -> None:
+    """Save figures as both PNG and PDF."""
+
+    fig.tight_layout()
+
+    fig.savefig(
+        path.with_suffix(
+            ".png"
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    fig.savefig(
+        path.with_suffix(
+            ".pdf"
+        ),
+        bbox_inches="tight",
+    )
+
+    plt.close(
+        fig
+    )
+
+
+def plot_model_comparison(
+    comparison_df: pd.DataFrame,
+    figure_dir: Path,
+    target: str,
+) -> None:
+    """Plot LORO RMSE for all candidate models."""
+
+    subset = (
+        comparison_df[
+            comparison_df[
+                "target"
+            ]
+            == target
+        ]
+        .sort_values(
+            "RMSE"
+        )
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(8.5, 5)
+    )
+
+    ax.bar(
+        subset[
+            "model"
+        ],
+        subset[
+            "RMSE"
+        ],
+    )
+
+    ax.set_ylabel(
+        f"LORO RMSE "
+        f"({UNITS[target]})"
+    )
+
+    ax.set_xlabel(
+        "Model"
+    )
+
+    ax.set_title(
+        f"{target}: "
+        "model comparison"
+    )
+
+    ax.tick_params(
+        axis="x",
+        rotation=30,
+    )
+
+    save_figure(
+        fig,
+        figure_dir
+        / f"{target.lower()}_model_comparison",
+    )
+
+
+def plot_selected_predictions(
+    bootstrap_df: pd.DataFrame,
+    figure_dir: Path,
+    target: str,
+) -> None:
+    """Plot measured and bootstrap-predicted values for held-out Runs."""
+
+    subset = (
+        bootstrap_df[
+            bootstrap_df[
+                "target"
+            ]
+            == target
+        ]
+        .sort_values(
+            "held_out_run"
+        )
+    )
+
+    x = subset[
+        "held_out_run"
+    ].to_numpy(
+        dtype=float
+    )
+
+    predicted = subset[
+        "predicted_mean"
+    ].to_numpy(
+        dtype=float
+    )
+
+    lower_error = (
+        predicted
+        - subset[
+            "ci95_low"
+        ].to_numpy(
+            dtype=float
+        )
+    )
+
+    upper_error = (
+        subset[
+            "ci95_high"
+        ].to_numpy(
+            dtype=float
+        )
+        - predicted
+    )
+
+    measured = subset[
+        "actual_run_mean"
+    ].to_numpy(
+        dtype=float
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(8, 5)
+    )
+
+    ax.plot(
+        x,
+        measured,
+        marker="o",
+        label="Measured Run mean",
+    )
+
+    ax.errorbar(
+        x,
+        predicted,
+        yerr=np.vstack(
+            [
+                lower_error,
+                upper_error,
+            ]
+        ),
+        fmt="s",
+        capsize=3,
+        label=(
+            "Predicted mean "
+            "with 95% bootstrap CI"
+        ),
+    )
+
+    ax.set_xlabel(
+        "Held-out Run"
+    )
+
+    ax.set_ylabel(
+        f"{target} "
+        f"({UNITS[target]})"
+    )
+
+    ax.set_title(
+        f"{target}: "
+        f"{subset['model'].iloc[0]}"
+    )
+
+    ax.legend(
+        frameon=False
+    )
+
+    save_figure(
+        fig,
+        figure_dir
+        / f"{target.lower()}_selected_predictor",
+    )
+
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+
+def main() -> None:
+    np.random.seed(
+        RANDOM_SEED
+    )
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    figure_dir = (
+        OUTPUT_DIR
+        / "figures"
+    )
+
+    figure_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    image_df, model_df = (
+        load_data()
+    )
+
+    print(
+        "=" * 72
+    )
+
+    print(
+        "DOE-AWARE MORPHOLOGY PREDICTION"
+    )
+
+    print(
+        "=" * 72
+    )
+
+    print(
+        f"SEM images       : "
+        f"{len(image_df)}"
+    )
+
+    print(
+        f"Independent Runs : "
+        f"{model_df[RUN_COLUMN].nunique()}"
+    )
+
+    print(
+        f"Bootstrap draws  : "
+        f"{N_BOOTSTRAP}"
+    )
+
+    # -------------------------------------------------------------------------
+    # Run statistics
+    # -------------------------------------------------------------------------
+
+    model_df.to_csv(
+        OUTPUT_DIR
+        / "run_statistics.csv",
+        index=False,
+    )
+
+    # -------------------------------------------------------------------------
+    # LORO model comparison
+    # -------------------------------------------------------------------------
+
+    (
+        base_predictions,
+        base_comparison,
+    ) = run_loro(
+        model_df
+    )
+
+    # -------------------------------------------------------------------------
+    # Weighted ensemble
+    # -------------------------------------------------------------------------
+
+    ensemble_weights = (
+        calculate_ensemble_weights(
+            base_comparison
+        )
+    )
+
+    all_predictions = (
+        add_ensemble_predictions(
+            base_predictions,
+            ensemble_weights,
+        )
+    )
+
+    final_comparison = (
+        summarize_models(
+            all_predictions
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Model selection
+    # -------------------------------------------------------------------------
+
+    selected_predictors = (
+        select_final_predictors(
+            final_comparison
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Hierarchical bootstrap
+    # -------------------------------------------------------------------------
+
+    bootstrap_results = (
+        hierarchical_bootstrap(
+            image_df=image_df,
+            model_df=model_df,
+            selected_df=
+                selected_predictors,
+            weight_df=
+                ensemble_weights,
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Training domain
+    # -------------------------------------------------------------------------
+
+    training_domain = (
+        build_training_domain(
+            model_df
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Save tables
+    # -------------------------------------------------------------------------
+
+    base_predictions.to_csv(
+        OUTPUT_DIR
+        / "loro_predictions.csv",
+        index=False,
+    )
+
+    all_predictions.to_csv(
+        OUTPUT_DIR
+        / "loro_predictions_with_ensemble.csv",
+        index=False,
+    )
+
+    final_comparison.to_csv(
+        OUTPUT_DIR
+        / "model_comparison.csv",
+        index=False,
+    )
+
+    selected_predictors.to_csv(
+        OUTPUT_DIR
+        / "selected_predictors.csv",
+        index=False,
+    )
+
+    ensemble_weights.to_csv(
+        OUTPUT_DIR
+        / "ensemble_weights.csv",
+        index=False,
+    )
+
+    bootstrap_results.to_csv(
+        OUTPUT_DIR
+        / "bootstrap_results.csv",
+        index=False,
+    )
+
+    training_domain.to_csv(
+        OUTPUT_DIR
+        / "training_domain.csv",
+        index=False,
+    )
+
+    # -------------------------------------------------------------------------
+    # Figures
+    # -------------------------------------------------------------------------
+
+    for target in [
+        "Coverage",
+        "Width",
+    ]:
+        plot_model_comparison(
+            final_comparison,
+            figure_dir,
+            target,
+        )
+
+        plot_selected_predictions(
+            bootstrap_results,
+            figure_dir,
+            target,
+        )
+
+    # -------------------------------------------------------------------------
+    # Reproducibility metadata
+    # -------------------------------------------------------------------------
+
+    metadata = {
+        "random_seed":
+            RANDOM_SEED,
+        "bootstrap_iterations":
+            N_BOOTSTRAP,
+        "independent_runs":
+            int(
+                model_df[
+                    RUN_COLUMN
+                ].nunique()
+            ),
+        "image_rows":
+            int(
+                len(
+                    image_df
+                )
+            ),
+        "features":
+            FEATURES,
+        "targets":
+            IMAGE_TARGETS,
+        "validation":
+            "Leave-One-Run-Out",
+        "models":
+            list(
+                create_models(
+                    RANDOM_SEED
+                ).keys()
+            ),
+        "ensemble":
+            (
+                "Inverse squared "
+                "LORO RMSE weighting"
+            ),
+        "selection_rule":
+            (
+                "Lowest LORO RMSE, "
+                "then MAE, then ErrorSD"
+            ),
+    }
+
+    (
+        OUTPUT_DIR
+        / "metadata.json"
+    ).write_text(
+        json.dumps(
+            metadata,
+            indent=4,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        "\n"
+        + "=" * 72
+    )
+
+    print(
+        "FINAL MODEL COMPARISON"
+    )
+
+    print(
+        "=" * 72
+    )
+
+    print(
+        final_comparison.to_string(
+            index=False
+        )
+    )
+
+    print(
+        "\n"
+        + "=" * 72
+    )
+
+    print(
+        "SELECTED PREDICTORS"
+    )
+
+    print(
+        "=" * 72
+    )
+
+    print(
+        selected_predictors.to_string(
+            index=False
+        )
+    )
+
+    print(
+        f"\nOutputs saved to:\n"
+        f"{OUTPUT_DIR}"
+    )
+
+
+if __name__ == "__main__":
+    main()
